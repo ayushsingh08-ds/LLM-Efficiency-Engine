@@ -23,13 +23,13 @@ services:
       - postgres
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
       DB_HOST: postgres
       DB_NAME: llm_logs
       DB_USER: postgres
       DB_PASSWORD: postgres
-      env_file:
-        - .env
 
 volumes:
   postgres_data:
