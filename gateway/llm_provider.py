@@ -4,6 +4,8 @@ import json
 import time
 import logging
 import psycopg2
+import re
+import hashlib
 from pythonjsonlogger import jsonlogger
 from gateway.router import RoundRobinRouter
 from dotenv import load_dotenv
@@ -43,6 +45,8 @@ DEFAULT_MODELS = {
     "groq": "llama-3.1-8b-instant",
     "ollama": "gemma3:4b",
 }
+
+MAX_LOG_TEXT_LENGTH = 500
 
 
 def _estimate_tokens(text: str) -> int:
@@ -85,16 +89,57 @@ def _calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return round(input_tokens * pricing["input"] + output_tokens * pricing["output"], 8)
 
 
-def _log_to_db(provider, model, prompt, response, latency_ms, cost):
+def _truncate_for_log(text: str, limit: int = MAX_LOG_TEXT_LENGTH) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _tokenize_for_overlap(text: str) -> set[str]:
+    return set(re.findall(r"\b[a-zA-Z0-9]{3,}\b", text.lower()))
+
+
+def _estimate_quality(prompt: str, response: str, latency_ms: int) -> tuple[float, str]:
+    # Heuristic quality score (0-1): checks useful length, prompt-response overlap, and latency.
+    if not response.strip():
+        return 0.0, "poor"
+
+    response_len = len(response)
+    length_component = min(response_len / 500, 1.0) * 0.45
+
+    prompt_terms = _tokenize_for_overlap(prompt)
+    response_terms = _tokenize_for_overlap(response)
+    overlap_ratio = 0.0
+    if prompt_terms:
+        overlap_ratio = len(prompt_terms & response_terms) / len(prompt_terms)
+    overlap_component = min(overlap_ratio, 1.0) * 0.35
+
+    latency_component = 0.20 if latency_ms <= 2500 else max(0.0, 0.20 - ((latency_ms - 2500) / 10000))
+
+    score = round(min(length_component + overlap_component + latency_component, 1.0), 4)
+
+    if score >= 0.8:
+        label = "excellent"
+    elif score >= 0.6:
+        label = "good"
+    elif score >= 0.4:
+        label = "fair"
+    else:
+        label = "poor"
+
+    return score, label
+
+
+def _log_to_db(provider, model, prompt, response, latency_ms, cost, quality_score):
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         cur = conn.cursor()
 
         cur.execute("""
             INSERT INTO llm_requests
-            (provider, model, prompt, response, latency_ms, cost_usd)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (provider, model, prompt, response, latency_ms, cost))
+            (provider, model, prompt, response, latency_ms, cost_usd, quality_score)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (provider, model, prompt, response, latency_ms, cost, quality_score))
 
         conn.commit()
         cur.close()
@@ -133,13 +178,18 @@ def send_prompt(
     latency_ms = int((time.time() - start_time) * 1000)
 
     actual_cost = _calculate_cost(model_name, input_tokens, output_tokens)
+    quality_score, quality_label = _estimate_quality(prompt, text, latency_ms)
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
     # Structured log for every request
     logger.info("request_completed", extra={
+        "prompt": _truncate_for_log(prompt),
+        "prompt_hash": prompt_hash,
         "provider": provider,
         "model": model_name,
         "prompt_length": len(prompt),
         "prompt_preview": prompt[:100],
+        "response_preview": _truncate_for_log(text),
         "response_length": len(text),
         "latency_ms": latency_ms,
         "input_tokens": input_tokens,
@@ -147,6 +197,8 @@ def send_prompt(
         "total_tokens": input_tokens + output_tokens,
         "estimated_cost_usd": estimated["estimated_cost_usd"],
         "actual_cost_usd": actual_cost,
+        "quality_score": quality_score,
+        "quality_label": quality_label,
         "cost_accuracy": round(actual_cost / estimated["estimated_cost_usd"], 2) if estimated["estimated_cost_usd"] > 0 else None,
         "tokens_per_second": round(output_tokens / (latency_ms / 1000), 1) if latency_ms > 0 else 0,
     })
@@ -157,7 +209,8 @@ def send_prompt(
         prompt=prompt,
         response=text,
         latency_ms=latency_ms,
-        cost=actual_cost
+        cost=actual_cost,
+        quality_score=quality_score
     )
 
     return {
@@ -165,6 +218,10 @@ def send_prompt(
         "provider": provider,
         "model": model_name,
         "latency_ms": latency_ms,
+        "quality": {
+            "score": quality_score,
+            "label": quality_label,
+        },
         "tokens": {
             "input": input_tokens,
             "output": output_tokens,
