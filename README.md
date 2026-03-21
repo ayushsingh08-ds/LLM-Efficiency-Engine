@@ -1,6 +1,6 @@
 # Cost & Carbon-Aware LLM Gateway
 
-Intelligent infrastructure layer that reduces enterprise AI spending by 40-60% while cutting carbon emissions by 30-50%.
+Intelligent infrastructure layer that reduces enterprise AI spending while cutting carbon emissions 
 
 ## Overview
 
