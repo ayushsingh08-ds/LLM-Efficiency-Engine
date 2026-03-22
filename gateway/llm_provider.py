@@ -8,6 +8,9 @@ import re
 import hashlib
 from pythonjsonlogger import jsonlogger
 from gateway.router import RoundRobinRouter
+from cache.embeddings import prompt_to_vector
+from cache.milvus_cache import search_similar_embedding, store_cache_entry
+from cache.redis_cache import get_cached_response, store_cached_response
 from dotenv import load_dotenv
 import os
 load_dotenv()
@@ -47,6 +50,28 @@ DEFAULT_MODELS = {
 }
 
 MAX_LOG_TEXT_LENGTH = 500
+DEFAULT_CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.95"))
+_cache_similarity_threshold = DEFAULT_CACHE_SIMILARITY_THRESHOLD
+
+
+def _normalize_similarity_threshold(value: float) -> float:
+    threshold = float(value)
+    if threshold <= 0 or threshold > 1:
+        raise ValueError("similarity_threshold must be > 0 and <= 1")
+    return threshold
+
+
+def get_cache_similarity_threshold() -> float:
+    return _cache_similarity_threshold
+
+
+def set_cache_similarity_threshold(value: float) -> float:
+    global _cache_similarity_threshold
+    _cache_similarity_threshold = _normalize_similarity_threshold(value)
+    logger.info("cache_similarity_threshold_updated", extra={
+        "similarity_threshold": _cache_similarity_threshold,
+    })
+    return _cache_similarity_threshold
 
 
 def _estimate_tokens(text: str) -> int:
@@ -155,6 +180,141 @@ def send_prompt(
     temperature: float = 0.7,
     max_tokens: int = 1024
 ) -> dict:
+    overall_start_time = time.time()
+    similarity_threshold = get_cache_similarity_threshold()
+    bypass_cache = False
+
+    # Tier 1: Exact-match cache lookup in Redis.
+    redis_cached = None
+    try:
+        redis_cached = get_cached_response(prompt)
+    except Exception as e:
+        bypass_cache = True
+        logger.warning("redis_cache_lookup_failed", extra={"error": str(e)})
+
+    if redis_cached is not None:
+        latency_ms = int((time.time() - overall_start_time) * 1000)
+        cached_response = redis_cached.get("response", "")
+        quality_score, quality_label = _estimate_quality(prompt, cached_response, latency_ms)
+
+        logger.info("redis_cache_hit", extra={
+            "prompt": _truncate_for_log(prompt),
+            "latency_ms": latency_ms,
+            "provider": "cache",
+            "model": redis_cached.get("model", "exact-cache"),
+            "quality_score": quality_score,
+            "quality_label": quality_label,
+        })
+
+        _log_to_db(
+            provider="cache",
+            model=redis_cached.get("model", "exact-cache"),
+            prompt=prompt,
+            response=cached_response,
+            latency_ms=latency_ms,
+            cost=0.0,
+            quality_score=quality_score,
+        )
+
+        return {
+            "response": cached_response,
+            "provider": "cache",
+            "model": redis_cached.get("model", "exact-cache"),
+            "latency_ms": latency_ms,
+            "cache": {
+                "hit": True,
+                "layer": "redis",
+                "similarity": 1.0,
+            },
+            "quality": {
+                "score": quality_score,
+                "label": quality_label,
+            },
+            "tokens": {
+                "input": 0,
+                "output": 0,
+            },
+            "cost": {
+                "estimated_usd": 0.0,
+                "actual_usd": 0.0,
+                "max_possible_usd": 0.0,
+            },
+        }
+
+    prompt_embedding: Optional[list[float]] = None
+    cached_match = None
+    if not bypass_cache:
+        try:
+            prompt_embedding = prompt_to_vector(prompt)
+            cached_match = search_similar_embedding(
+                prompt_embedding,
+                similarity_threshold=similarity_threshold,
+            )
+        except Exception as e:
+            bypass_cache = True
+            logger.warning("semantic_cache_lookup_failed", extra={"error": str(e)})
+
+    if cached_match is not None:
+        latency_ms = int((time.time() - overall_start_time) * 1000)
+        cached_response = cached_match["response"]
+        quality_score, quality_label = _estimate_quality(prompt, cached_response, latency_ms)
+
+        logger.info("semantic_cache_hit", extra={
+            "prompt": _truncate_for_log(prompt),
+            "matched_prompt": _truncate_for_log(cached_match["prompt"]),
+            "similarity": round(cached_match["similarity"], 4),
+            "latency_ms": latency_ms,
+            "provider": "cache",
+            "model": cached_match.get("model", "semantic-cache"),
+            "quality_score": quality_score,
+            "quality_label": quality_label,
+        })
+
+        _log_to_db(
+            provider="cache",
+            model=cached_match.get("model", "semantic-cache"),
+            prompt=prompt,
+            response=cached_response,
+            latency_ms=latency_ms,
+            cost=0.0,
+            quality_score=quality_score,
+        )
+
+        # Write-through semantic hit to Redis so future exact requests resolve faster.
+        try:
+            store_cached_response(
+                prompt=prompt,
+                response=cached_response,
+                provider=cached_match.get("provider", "cache"),
+                model=cached_match.get("model", "semantic-cache"),
+            )
+        except Exception as e:
+            logger.warning("redis_cache_store_failed", extra={"error": str(e)})
+
+        return {
+            "response": cached_response,
+            "provider": "cache",
+            "model": cached_match.get("model", "semantic-cache"),
+            "latency_ms": latency_ms,
+            "cache": {
+                "hit": True,
+                "layer": "milvus",
+                "similarity": round(cached_match["similarity"], 4),
+            },
+            "quality": {
+                "score": quality_score,
+                "label": quality_label,
+            },
+            "tokens": {
+                "input": 0,
+                "output": 0,
+            },
+            "cost": {
+                "estimated_usd": 0.0,
+                "actual_usd": 0.0,
+                "max_possible_usd": 0.0,
+            },
+        }
 
     if provider is None:
         provider = router.next_provider()
@@ -213,11 +373,39 @@ def send_prompt(
         quality_score=quality_score
     )
 
+    try:
+        if prompt_embedding is None:
+            prompt_embedding = prompt_to_vector(prompt)
+        store_cache_entry(
+            prompt=prompt,
+            response=text,
+            embedding=prompt_embedding,
+            provider=provider,
+            model=model_name,
+        )
+    except Exception as e:
+        logger.warning("semantic_cache_store_failed", extra={"error": str(e)})
+
+    try:
+        store_cached_response(
+            prompt=prompt,
+            response=text,
+            provider=provider,
+            model=model_name,
+        )
+    except Exception as e:
+        logger.warning("redis_cache_store_failed", extra={"error": str(e)})
+
     return {
         "response": text,
         "provider": provider,
         "model": model_name,
         "latency_ms": latency_ms,
+        "cache": {
+            "hit": False,
+            "layer": "live",
+            "similarity": None,
+        },
         "quality": {
             "score": quality_score,
             "label": quality_label,

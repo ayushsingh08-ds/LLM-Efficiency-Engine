@@ -1,0 +1,31 @@
+# VCS and editor metadata
+.git
+.gitignore
+.vscode
+
+# Python caches and virtual envs
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Local env and temp files
+.env
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# Local data and docs not needed in runtime image
+*.md
+cache_data/
+
+# Test and local artifacts not required in runtime image
+tests/
+load_test_results.log
+load_test_gateway_fixed.py
+
+# Docker artifacts
+*.tar

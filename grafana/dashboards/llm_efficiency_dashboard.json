@@ -1,0 +1,304 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "llm-postgres"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 20
+              },
+              {
+                "color": "green",
+                "value": 40
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.1.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "llm-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  ROUND((COUNT(*) FILTER (WHERE provider = 'cache')) * 100.0 / NULLIF(COUNT(*), 0), 2) AS value\nFROM llm_requests;",
+          "refId": "A"
+        }
+      ],
+      "title": "Cache Hit Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "llm-postgres"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 6,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.001
+              }
+            ]
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.1.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "llm-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH non_cache AS (\n  SELECT AVG(cost_usd) AS avg_non_cache_cost\n  FROM llm_requests\n  WHERE provider <> 'cache'\n),\ncache_count AS (\n  SELECT COUNT(*)::numeric AS cache_hits\n  FROM llm_requests\n  WHERE provider = 'cache'\n)\nSELECT ROUND(non_cache.avg_non_cache_cost * cache_count.cache_hits, 6) AS value\nFROM non_cache\nCROSS JOIN cache_count;",
+          "refId": "A"
+        }
+      ],
+      "title": "Estimated Savings (Avg-Cost Method)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "llm-postgres"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 6,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.001
+              }
+            ]
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.1.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "llm-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH first_live_cost AS (\n  SELECT\n    prompt,\n    MIN(cost_usd) FILTER (WHERE provider <> 'cache') AS baseline_cost\n  FROM llm_requests\n  GROUP BY prompt\n),\ncache_prompts AS (\n  SELECT\n    prompt,\n    COUNT(*) AS cache_hits_for_prompt\n  FROM llm_requests\n  WHERE provider = 'cache'\n  GROUP BY prompt\n),\njoined AS (\n  SELECT\n    c.prompt,\n    c.cache_hits_for_prompt,\n    f.baseline_cost\n  FROM cache_prompts c\n  JOIN first_live_cost f ON f.prompt = c.prompt\n  WHERE f.baseline_cost IS NOT NULL\n)\nSELECT ROUND(SUM(cache_hits_for_prompt * baseline_cost), 6) AS value\nFROM joined;",
+          "refId": "A"
+        }
+      ],
+      "title": "Estimated Savings (Prompt-Matched)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "llm-postgres"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "id": 4,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "cache_hits"
+          }
+        ]
+      },
+      "pluginVersion": "11.1.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "postgres",
+            "uid": "llm-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH categorized AS (\n  SELECT\n    CASE\n      WHEN prompt ~* '(refund|money back|chargeback|subscription)' THEN 'billing_refund'\n      WHEN prompt ~* '(password|reset|login|sign in|2fa|mfa|auth)' THEN 'auth_account_access'\n      WHEN prompt ~* '(rate limit|throttle|requests per minute|quota)' THEN 'api_limits'\n      WHEN prompt ~* '(invoice|receipt|billing)' THEN 'billing_invoices'\n      WHEN prompt ~* '(delete account|remove account|close account)' THEN 'account_deletion'\n      WHEN prompt ~* '(upgrade|downgrade|plan|pricing tier)' THEN 'plan_change'\n      WHEN prompt ~* '(invite|teammate|workspace|organization|team)' THEN 'team_management'\n      WHEN prompt ~* '(cache|caching|redis|milvus)' THEN 'caching_topics'\n      ELSE 'other'\n    END AS query_type,\n    provider\n  FROM llm_requests\n)\nSELECT\n  query_type,\n  COUNT(*) FILTER (WHERE provider = 'cache') AS cache_hits,\n  COUNT(*) AS total_requests,\n  ROUND((COUNT(*) FILTER (WHERE provider = 'cache')) * 100.0 / NULLIF(COUNT(*), 0), 2) AS hit_rate_pct\nFROM categorized\nGROUP BY query_type\nORDER BY cache_hits DESC, hit_rate_pct DESC;",
+          "refId": "A"
+        }
+      ],
+      "title": "Cache Hits by Query Type",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "cache",
+    "cost",
+    "llm"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "LLM Cost Ledger Dashboard",
+  "uid": "llm-efficiency-ledger",
+  "version": 1,
+  "weekStart": ""
+}
