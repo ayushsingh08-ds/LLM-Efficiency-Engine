@@ -23,7 +23,6 @@ venv/
 cache_data/
 
 # Test and local artifacts not required in runtime image
-tests/
 load_test_results.log
 load_test_gateway_fixed.py
 

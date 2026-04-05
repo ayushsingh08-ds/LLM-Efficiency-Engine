@@ -1,0 +1,24 @@
+providers:
+  - provider_name: groq
+    model_name: llama-3.1-8b-instant
+    api_env_key: GROQ_API_KEY
+    base_url: https://api.groq.com/openai/v1
+    cost_per_1k_input_tokens: 0.00005
+    cost_per_1k_output_tokens: 0.00008
+    best_use_case: low-latency general chat
+
+  - provider_name: openai
+    model_name: gpt-4o-mini
+    api_env_key: OPENAI_API_KEY
+    base_url: https://api.openai.com/v1
+    cost_per_1k_input_tokens: 0.00015
+    cost_per_1k_output_tokens: 0.0006
+    best_use_case: strong quality with moderate cost
+
+  - provider_name: ollama
+    model_name: llama3.1:8b
+    api_env_key: OLLAMA_API_KEY
+    base_url: http://localhost:11434
+    cost_per_1k_input_tokens: 0.0
+    cost_per_1k_output_tokens: 0.0
+    best_use_case: local private inference
