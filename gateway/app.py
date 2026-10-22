@@ -1,15 +1,18 @@
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from gateway.llm_provider import (
+    AllProvidersFailedError,
     estimate_cost,
     get_cache_similarity_threshold,
     logger,
     send_prompt,
     set_cache_similarity_threshold,
 )
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import time
 from cache import redis_cache, milvus_cache
+from gateway import hardware as hw_module
+from gateway.hardware import sample_hardware, sample_as_dict
 
 app = FastAPI()
 
@@ -35,13 +38,72 @@ CACHE_RESPONSE_LATENCY = Histogram(
     ["cache_status"]
 )
 
+# Hardware/resource gauges. Refreshed on each /metrics and /hardware scrape.
+HW_CPU_PERCENT = Gauge("host_cpu_percent", "Host CPU utilisation percent")
+HW_RAM_PERCENT = Gauge("host_ram_percent", "Host RAM utilisation percent")
+HW_GPU_UTIL = Gauge("host_gpu_utilization_percent", "GPU utilisation percent", ["gpu"])
+HW_GPU_POWER = Gauge("host_gpu_power_watts", "GPU power draw in watts (measured, if available)", ["gpu"])
+# Labelled estimated vs measured so dashboards never mistake an estimate for a reading.
+HW_ACTIVE_POWER = Gauge(
+    "host_active_power_watts",
+    "Active power in watts; measured=1 when from GPU telemetry, else a coarse estimate",
+    ["measured"],
+)
+
+
+def _refresh_hardware_gauges() -> dict:
+    # Respect the master profiling switch: when disabled we sample nothing, touch
+    # no gauges, and add zero overhead. The app keeps working normally.
+    if not hw_module.profiling_enabled():
+        return {"profiling_enabled": False}
+    sample = sample_hardware(cpu_interval=0.0)
+    HW_CPU_PERCENT.set(sample.cpu_percent)
+    HW_RAM_PERCENT.set(sample.ram_percent)
+    for g in sample.gpus:
+        HW_GPU_UTIL.labels(gpu=str(g["index"])).set(g["utilization_percent"])
+        if g["power_watts"] is not None:
+            HW_GPU_POWER.labels(gpu=str(g["index"])).set(g["power_watts"])
+    HW_ACTIVE_POWER.labels(
+        measured="true" if sample.energy_is_measured else "false"
+    ).set(sample.estimated_active_power_watts)
+    result = sample_as_dict(cpu_interval=0.0)
+    result["profiling_enabled"] = True
+    return result
+
 class PromptRequest(BaseModel):
     prompt: str
     provider: str | None = None
+    # "roundrobin" (default) or "smart". Smart routing only applies when no
+    # explicit provider is given; it falls back to round-robin if unavailable.
+    routing_mode: str | None = None
 
 @app.get("/metrics")
 def metrics():
+    # Refresh hardware gauges so a Prometheus scrape reflects current usage.
+    try:
+        _refresh_hardware_gauges()
+    except Exception as e:
+        logger.warning("hardware_sample_failed", extra={"error": str(e)})
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/health/providers")
+def provider_health():
+    """Current in-memory provider health (per-process, resets on restart).
+
+    Reflects recent live-call outcomes. Routing deprioritises unhealthy providers
+    but never drops them from the failover chain.
+    """
+    from gateway.provider_health import registry as health_registry
+
+    return {"providers": health_registry.snapshot()}
+
+
+@app.get("/hardware")
+def hardware():
+    """Current host resource usage. Energy figures are estimates unless
+    energy_is_measured is true (real GPU power telemetry)."""
+    return _refresh_hardware_gauges()
 
 @app.post("/estimate")
 def estimate(request: PromptRequest):
@@ -59,7 +121,8 @@ def generate(request: PromptRequest):
     try:
         result = send_prompt(
             prompt=request.prompt,
-            provider=request.provider
+            provider=request.provider,
+            routing_mode=request.routing_mode,
         )
         resolved_provider = result.get("provider", provider)
         cache_hit = bool(result.get("cache", {}).get("hit", False))
@@ -68,6 +131,17 @@ def generate(request: PromptRequest):
         REQUEST_COUNT.labels(provider=resolved_provider, status="success").inc()
         CACHE_REQUEST_COUNT.labels(cache_status=cache_status).inc()
         return result
+    except AllProvidersFailedError as e:
+        # Every eligible provider failed after failover — controlled 502.
+        REQUEST_COUNT.labels(provider=provider, status="error").inc()
+        logger.error("all_providers_failed", extra={
+            "provider": provider,
+            "attempts": e.attempts,
+        })
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "all_providers_failed", "attempts": e.attempts},
+        )
     except Exception as e:
         REQUEST_COUNT.labels(provider=provider, status="error").inc()
         logger.error("request_failed", extra={

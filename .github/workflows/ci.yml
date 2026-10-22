@@ -27,5 +27,4 @@ jobs:
         env:
           PYTHONPATH: .
         run: |
-          python -m unittest discover -s tests -p "test_knn_router.py"
-          python -m unittest discover -s tests -p "test_phase3_pipeline.py"
+          python -m unittest discover -s tests -p "test_*.py"

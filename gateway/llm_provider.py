@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 import requests
 import json
 import time
@@ -6,8 +6,10 @@ import logging
 import psycopg2
 import re
 import hashlib
+from prometheus_client import Counter
 from pythonjsonlogger import jsonlogger
 from gateway.router import RoundRobinRouter
+from gateway.provider_health import registry as health_registry
 from cache.embeddings import prompt_to_vector
 from cache.milvus_cache import search_similar_embedding, store_cache_entry
 from cache.redis_cache import get_cached_response, store_cached_response
@@ -25,10 +27,14 @@ if not logger.handlers:
     ))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
-# API Configuration - HARDCODED (WARNING: Not secure for production!)
-OLLAMA_API_URL = "https://ollama.com/api"
+# API configuration (all secrets sourced from environment / .env)
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "https://ollama.com/api")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+
+# Per-provider HTTP timeout (seconds). Applied to every live provider call so a
+# hung provider triggers failover instead of blocking the request forever.
+PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60"))
 
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
@@ -36,7 +42,34 @@ DB_CONFIG = {
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD")
 }
-router = RoundRobinRouter(["groq", "ollama"])
+
+# Providers the live gateway can actually dispatch to (a live client exists below).
+# NOTE: openai is defined in configs/models.yaml and src/clients for the offline
+# pipeline, but is intentionally not wired into the live gateway dispatch table.
+SUPPORTED_PROVIDERS = ["groq", "ollama"]
+router = RoundRobinRouter(SUPPORTED_PROVIDERS)
+
+# Prometheus metrics for failover observability. Defined on the default registry
+# so they are exported by gateway.app's existing /metrics endpoint automatically.
+PROVIDER_ATTEMPT_COUNT = Counter(
+    "llm_provider_attempts_total",
+    "Live provider call attempts, labelled by provider and outcome",
+    ["provider", "outcome"],
+)
+FAILOVER_COUNT = Counter(
+    "llm_failover_total",
+    "Number of times a request fell back from one provider to another",
+    ["from_provider", "to_provider"],
+)
+
+
+class AllProvidersFailedError(RuntimeError):
+    """Raised when every eligible provider failed for a single request."""
+
+    def __init__(self, attempts: list[dict]):
+        self.attempts = attempts
+        providers = ", ".join(a["provider"] for a in attempts) or "none"
+        super().__init__(f"All providers failed ({providers})")
 
 # Pricing per token (USD) — source: console.groq.com/docs/pricing
 MODEL_PRICING = {
@@ -173,14 +206,115 @@ def _log_to_db(provider, model, prompt, response, latency_ms, cost, quality_scor
     except Exception as e:
         logger.error("db_logging_failed", extra={"error": str(e)})
         
+def _get_dispatch(provider: str) -> Optional[Callable[..., tuple[str, int, int]]]:
+    """Return the live sender for a provider, or None if unsupported.
+
+    Resolved at call time so it always reflects the module-level senders,
+    and so tests can monkeypatch _send_to_groq / _send_to_ollama.
+    """
+    return {
+        "groq": _send_to_groq,
+        "ollama": _send_to_ollama,
+    }.get(provider)
+
+
+def _ordered_providers(preferred: Optional[str]) -> list[str]:
+    """Build the failover order: preferred provider first, then the rest.
+
+    If no provider is requested, the round-robin router chooses the primary so
+    load is still spread across providers; remaining supported providers form
+    the fallback chain in a stable order.
+    """
+    if preferred is None:
+        preferred = router.next_provider()
+
+    order = [preferred]
+    for provider in SUPPORTED_PROVIDERS:
+        if provider not in order:
+            order.append(provider)
+    # Deprioritise (but never drop) providers that are currently unhealthy, so a
+    # healthy provider is tried first while failover to an unhealthy one is kept
+    # as a last resort.
+    return health_registry.prioritize(order)
+
+
+def _invoke_with_failover(
+    prompt: str,
+    ordered_providers: list[str],
+    model: Optional[str],
+    temperature: float,
+    max_tokens: int,
+) -> dict:
+    """Try each provider in order until one succeeds.
+
+    A single request is only ever sent to one provider at a time; the next
+    provider is tried only after the current one raises. Returns a dict with the
+    winning provider's text/tokens plus failover metadata. Raises
+    AllProvidersFailedError if every provider fails.
+    """
+    attempts: list[dict] = []
+    previous_provider: Optional[str] = None
+
+    for provider in ordered_providers:
+        dispatch = _get_dispatch(provider)
+        if dispatch is None:
+            logger.warning("provider_unsupported_skipped", extra={"provider": provider})
+            attempts.append({"provider": provider, "error": "unsupported"})
+            continue
+
+        model_name = model or DEFAULT_MODELS.get(provider, "unknown")
+        if previous_provider is not None:
+            FAILOVER_COUNT.labels(from_provider=previous_provider, to_provider=provider).inc()
+            logger.warning("provider_failover", extra={
+                "from_provider": previous_provider,
+                "to_provider": provider,
+                "attempt": len(attempts) + 1,
+            })
+
+        start_time = time.time()
+        try:
+            text, input_tokens, output_tokens = dispatch(prompt, model_name, temperature, max_tokens)
+            latency_ms = int((time.time() - start_time) * 1000)
+            PROVIDER_ATTEMPT_COUNT.labels(provider=provider, outcome="success").inc()
+            health_registry.record_success(provider)
+            return {
+                "provider": provider,
+                "model": model_name,
+                "text": text,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "latency_ms": latency_ms,
+                "failover_used": previous_provider is not None,
+                "attempts": len(attempts) + 1,
+                "failed_providers": [a["provider"] for a in attempts],
+            }
+        except Exception as e:
+            PROVIDER_ATTEMPT_COUNT.labels(provider=provider, outcome="error").inc()
+            health_registry.record_failure(provider)
+            logger.error("provider_call_failed", extra={
+                "provider": provider,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            })
+            attempts.append({"provider": provider, "error": f"{type(e).__name__}: {e}"})
+            previous_provider = provider
+
+    raise AllProvidersFailedError(attempts)
+
+
+DEFAULT_ROUTING_MODE = os.getenv("GATEWAY_ROUTING_MODE", "roundrobin")
+
+
 def send_prompt(
     prompt: str,
     provider: Optional[str] = None,
     model: Optional[str] = None,
     temperature: float = 0.7,
-    max_tokens: int = 1024
+    max_tokens: int = 1024,
+    routing_mode: Optional[str] = None,
 ) -> dict:
     overall_start_time = time.time()
+    routing_mode = routing_mode or DEFAULT_ROUTING_MODE
     similarity_threshold = get_cache_similarity_threshold()
     bypass_cache = False
 
@@ -316,26 +450,37 @@ def send_prompt(
             },
         }
 
-    if provider is None:
-        provider = router.next_provider()
+    # Cache miss on both tiers: choose the provider order, then call live providers.
+    # Smart routing (if enabled and available) proposes a supported-provider order;
+    # otherwise we fall back to round-robin. Import is lazy to avoid a circular
+    # import (smart_router imports names from this module).
+    routing_meta = {"mode": routing_mode, "smart_used": False, "reason": None}
+    smart_order: list[str] = []
+    if routing_mode == "smart" and provider is None:
+        from gateway.smart_router import choose_provider_order
+        smart_order, routing_meta = choose_provider_order(prompt, mode="smart")
 
-    model_name = model or DEFAULT_MODELS.get(provider, "unknown")
-
-    # Estimate before calling API
-    estimated = estimate_cost(prompt, provider, model, max_tokens)
-
-    start_time = time.time()
-
-    if provider == "groq":
-        text, input_tokens, output_tokens = _send_to_groq(prompt, model_name, temperature, max_tokens)
-
-    elif provider == "ollama":
-        text, input_tokens, output_tokens = _send_to_ollama(prompt, model_name, temperature, max_tokens)
-
+    if smart_order:
+        ordered_providers = smart_order
     else:
-        raise ValueError(f"Unknown provider: {provider}")
+        ordered_providers = _ordered_providers(provider)
 
-    latency_ms = int((time.time() - start_time) * 1000)
+    # Estimate against the first (preferred) provider before calling the API.
+    estimated = estimate_cost(prompt, ordered_providers[0], model, max_tokens)
+
+    call = _invoke_with_failover(
+        prompt=prompt,
+        ordered_providers=ordered_providers,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    provider = call["provider"]
+    model_name = call["model"]
+    text = call["text"]
+    input_tokens = call["input_tokens"]
+    output_tokens = call["output_tokens"]
+    latency_ms = call["latency_ms"]
 
     actual_cost = _calculate_cost(model_name, input_tokens, output_tokens)
     quality_score, quality_label = _estimate_quality(prompt, text, latency_ms)
@@ -361,6 +506,11 @@ def send_prompt(
         "quality_label": quality_label,
         "cost_accuracy": round(actual_cost / estimated["estimated_cost_usd"], 2) if estimated["estimated_cost_usd"] > 0 else None,
         "tokens_per_second": round(output_tokens / (latency_ms / 1000), 1) if latency_ms > 0 else 0,
+        "failover_used": call["failover_used"],
+        "attempts": call["attempts"],
+        "failed_providers": call["failed_providers"],
+        "routing_mode": routing_meta.get("mode"),
+        "smart_routing_used": routing_meta.get("smart_used"),
     })
 
     _log_to_db(
@@ -419,6 +569,16 @@ def send_prompt(
             "actual_usd": actual_cost,
             "max_possible_usd": estimated["max_possible_cost_usd"],
         },
+        "failover": {
+            "used": call["failover_used"],
+            "attempts": call["attempts"],
+            "failed_providers": call["failed_providers"],
+        },
+        "routing": {
+            "mode": routing_meta.get("mode"),
+            "smart_used": routing_meta.get("smart_used"),
+            "reason": routing_meta.get("reason"),
+        },
     }
 
 def _send_to_groq(prompt: str, model: str, temperature: float, max_tokens: int) -> tuple[str, int, int]:
@@ -440,7 +600,7 @@ def _send_to_groq(prompt: str, model: str, temperature: float, max_tokens: int) 
         "max_tokens": max_tokens
     }
 
-    response = requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, json=payload, headers=headers, timeout=PROVIDER_TIMEOUT_SECONDS)
     response.raise_for_status()
 
     data = response.json()
@@ -474,7 +634,7 @@ def _send_to_ollama(prompt: str, model: str, temperature: float, max_tokens: int
         }
     }
 
-    response = requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, json=payload, headers=headers, timeout=PROVIDER_TIMEOUT_SECONDS)
     response.raise_for_status()
 
     # Ollama Cloud returns newline-delimited JSON chunks
