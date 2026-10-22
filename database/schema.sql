@@ -13,4 +13,4 @@ CREATE TABLE IF NOT EXISTS llm_requests (
 );
 
 ALTER TABLE llm_requests
-ADD COLUMN IF NOT EXISTS quality_score NUMERIC(5,4);
+ADD COLUMN IF NOT EXISTS quality_score NUMERIC(5,4);    

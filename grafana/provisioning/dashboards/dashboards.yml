@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: LLM Efficiency Dashboards
+    orgId: 1
+    folder: LLM Efficiency
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

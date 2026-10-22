@@ -1,0 +1,18 @@
+apiVersion: 1
+
+datasources:
+  - name: LLM Postgres
+    uid: llm-postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: postgres
+    database: llm_logs
+    isDefault: true
+    editable: true
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1500
+      timescaledb: false
+    secureJsonData:
+      password: postgres

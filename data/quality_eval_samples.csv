@@ -1,0 +1,4 @@
+request_id,prompt,response,reference
+1,"Summarize this sentence.","This sentence says we should optimize cost and quality.","Optimize cost and quality."
+2,"What is the main idea of model routing?","Model routing picks the right model for each query based on tradeoffs.","Model routing selects the best model for each query using quality and cost."
+3,"Explain A/B testing in one line.","A/B testing compares two strategies on real traffic to measure impact.","A/B testing compares two variants to estimate causal impact."

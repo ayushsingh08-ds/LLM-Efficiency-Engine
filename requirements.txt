@@ -5,4 +5,13 @@ psycopg2-binary
 pydantic
 python-dotenv
 prometheus-client
+psutil
 python-json-logger
+sentence-transformers
+pymilvus
+redis
+pandas
+matplotlib
+scikit-learn
+pyyaml
+numpy
