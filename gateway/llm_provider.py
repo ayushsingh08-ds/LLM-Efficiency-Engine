@@ -1,4 +1,9 @@
 from typing import Callable, Literal, Optional
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:
+    pass
 import requests
 import json
 import time

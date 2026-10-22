@@ -1,20 +1,25 @@
-from typing import Optional
+from typing import Any, Optional
 
-from sentence_transformers import SentenceTransformer
-
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:
+    torch = None
+    nn = None
 
 DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-_embedding_model: Optional[SentenceTransformer] = None
+_embedding_model: Optional[Any] = None
 
 
-def get_embedding_model(model_name: str = DEFAULT_EMBEDDING_MODEL) -> SentenceTransformer:
-	"""Load and return a singleton sentence-transformer model instance."""
-	global _embedding_model
+def get_embedding_model(model_name: str = DEFAULT_EMBEDDING_MODEL) -> Any:
+    """Load and return a singleton sentence-transformer model instance."""
+    global _embedding_model
 
-	if _embedding_model is None:
-		_embedding_model = SentenceTransformer(model_name)
+    if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+        _embedding_model = SentenceTransformer(model_name)
 
-	return _embedding_model
+    return _embedding_model
 
 
 def prompt_to_vector(prompt: str, model_name: str = DEFAULT_EMBEDDING_MODEL) -> list[float]:
