@@ -28,65 +28,7 @@ The **LLM Efficiency Engine** solves the runaway costs, unpredictable latencies,
 
 ## System Architecture
 
-```mermaid
-flowchart TD
-    subgraph ClientLayer ["Client Layer"]
-        App["Downstream App / Web UI"]
-        OpenAIClient["OpenAI SDK / LangChain / LlamaIndex"]
-    end
-
-    subgraph SecurityLayer ["Gateway & Guardrails (FastAPI)"]
-        Auth["API Key Auth & RBAC\n(GATEWAY_API_KEY / ADMIN_API_KEY)"]
-        Guardrails["Input Bounding & ReDoS Hardening\n(Max 32k Chars, Bounded Regex)"]
-        OpenAIRoute["/v1/chat/completions Adapter"]
-    end
-
-    subgraph CacheTier ["Two-Tier Semantic Cache"]
-        RedisCache[("L1: Redis Exact Cache\n(SHA-256 Key, <2ms)")]
-        MilvusCache[("L2: Milvus Vector Cache\n(all-MiniLM-L6-v2, Cosine >= 0.95, <30ms)")]
-    end
-
-    subgraph RoutingTier ["Intelligent Routing & Circuit Breaker"]
-        BudgetBreaker{"Postgres Budget Breaker\n(SELECT ... FOR UPDATE)"}
-        DiffRouter{"Difficulty Classifier\n(RouteLLM / FrugalGPT Heuristics)"}
-    end
-
-    subgraph ProviderLayer ["Multi-Provider Failover Mesh"]
-        GoogleGemini["Google Gemini 2.5 Flash Lite\n(Cheap Tier)"]
-        OpenRouter["OpenRouter / Flint / DeepSeek\n(Frontier Tier)"]
-    end
-
-    subgraph Observability ["Telemetry & Persistence"]
-        PGLogs[("PostgreSQL\n(Audit Logs & Budgets)")]
-        Prometheus["Prometheus /metrics"]
-        Grafana["Grafana Dashboards\n(:3000)"]
-        Hardware["Host Telemetry\n(psutil + NVML GPU Watts)"]
-    end
-
-    App --> Auth
-    OpenAIClient --> OpenAIRoute --> Auth
-    Auth --> Guardrails
-    Guardrails --> RedisCache
-
-    RedisCache -- "Exact Hit (<2ms)" --> App
-    RedisCache -- "Miss" --> MilvusCache
-
-    MilvusCache -- "Semantic Hit (<30ms)" --> RedisCache
-    MilvusCache -- "Miss" --> BudgetBreaker
-
-    BudgetBreaker -- "Budget Exceeded (HTTP 402)" --> App
-    BudgetBreaker -- "Approved" --> DiffRouter
-
-    DiffRouter -- "Simple (Short / Factual)" --> GoogleGemini
-    DiffRouter -- "Complex (Logic / Code / System)" --> OpenRouter
-
-    GoogleGemini -- "Failover on 5xx / Timeout" --> OpenRouter
-    OpenRouter -- "Failover on 5xx / Timeout" --> GoogleGemini
-
-    GoogleGemini & OpenRouter --> MilvusCache
-    GoogleGemini & OpenRouter --> PGLogs
-    Hardware --> Prometheus --> Grafana
-```
+![System Architecture](figures/architecture.png)
 
 ---
 
