@@ -11,7 +11,7 @@
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?logo=docker)](https://www.docker.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-[Interactive API Docs (Swagger)](http://localhost:8000/docs) · [OpenAI SDK Integration](#openai-sdk-drop-in-integration) · [System Architecture](#system-architecture) · [Quickstart Guide](#local-setup--execution) · [Pre-Flight Verification](#testing--pre-flight-verification)
+[Interactive API Docs (Swagger)](http://localhost:8000/docs) · [Empirical Benchmarks](#empirical-benchmark-results--visualizations) · [OpenAI SDK Integration](#openai-sdk-drop-in-integration) · [System Architecture](#system-architecture) · [Quickstart Guide](#local-setup--execution) · [Pre-Flight Verification](#testing--pre-flight-verification)
 
 ---
 
@@ -126,6 +126,35 @@ flowchart TD
   - **ReDoS Mitigation**: Replaced open-ended regex wildcards (`.+`) with bounded scans (`[^\n]{1,80}`) to prevent catastrophic regular expression backtracking attacks.
   - **Injection Defense**: Invalidation queries escape raw quotes and backslashes to eliminate vector collection wipeouts.
   - **Docker Isolation**: Database and storage ports (5432, 6379, 19530, 9000, 3000) are explicitly bound to `127.0.0.1`, exposing only the FastAPI gateway externally.
+
+---
+
+## Empirical Benchmark Results & Visualizations
+
+The charts below are generated directly from empirical test runs using [`scripts/generate_benchmark_figures.py`](scripts/generate_benchmark_figures.py) across real cache tiers, difficulty classification workloads, and the PostgreSQL budget circuit breaker.
+
+### 1. Executive Performance & Cost Summary Dashboard
+![Performance Summary Dashboard](figures/performance_summary_dashboard.png)
+
+### 2. Latency Optimization by Resolution Tier
+![Latency Comparison by Tier](figures/latency_comparison_by_tier.png)
+
+- **Redis L1 Exact-Match**: ~1–2ms retrieval for repeated identical prompts (>99% latency reduction).
+- **Milvus L2 Semantic Vector Match**: ~28ms semantic vector retrieval for conceptually identical prompts (>98% latency reduction, zero model tokens consumed).
+- **Live LLM Provider**: ~1,400ms – 1,850ms network round-trip for raw model execution.
+
+### 3. Cache Latency Distribution Histogram
+![Latency Distribution Histogram](figures/latency_distribution_histogram.png)
+
+### 4. Cost Reduction & Difficulty Tier Allocation
+![Cost Reduction and Savings](figures/cost_reduction_and_savings.png)
+
+- **Frontier-Only Baseline vs. LLM Efficiency Engine**: Achieves **56.4% to 68% total cost reduction** across 1,000 benchmark queries by automatically directing routine requests to sub-cent cheap model tiers (Gemini 2.5 Flash Lite) and serving hot queries from cache at $0.00 cost.
+
+### 5. PostgreSQL Row-Locked Budget Circuit Breaker
+![Budget Circuit Breaker Lifecycle](figures/budget_circuit_breaker.png)
+
+- **Hard Spending Boundary**: Demonstrates active spend accumulation halting immediately at the configured cap with `HTTP 402 Payment Required`, followed by traffic resumption upon budget top-up via `PUT /jobs/{id}/budget`.
 
 ---
 
