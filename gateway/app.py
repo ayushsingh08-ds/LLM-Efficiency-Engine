@@ -77,6 +77,7 @@ class PromptRequest(BaseModel):
     # "roundrobin" (default), "difficulty" (heuristic cheap vs frontier), or "smart" (k-NN).
     # Routing modes apply when no explicit provider is given.
     routing_mode: str | None = None
+    job_id: str | None = None
 
 
 class ClassifyRequest(BaseModel):
@@ -182,6 +183,7 @@ def generate(request: PromptRequest):
             prompt=request.prompt,
             provider=request.provider,
             routing_mode=request.routing_mode,
+            job_id=request.job_id,
         )
         resolved_provider = result.get("provider", provider)
         cache_hit = bool(result.get("cache", {}).get("hit", False))
@@ -202,6 +204,28 @@ def generate(request: PromptRequest):
             detail={"error": "all_providers_failed", "attempts": e.attempts},
         )
     except Exception as e:
+        # Check for budget circuit breaker errors
+        from gateway.budget import BudgetExceededError, JobNotFoundError
+        if isinstance(e, BudgetExceededError):
+            logger.warning("budget_limit_exceeded", extra={
+                "job_id": e.job_id,
+                "spent_usd": e.spent_usd,
+                "budget_usd": e.budget_usd,
+                "attempted_cost_usd": e.attempted_cost_usd,
+            })
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "budget_exceeded",
+                    "job_id": e.job_id,
+                    "budget_usd": e.budget_usd,
+                    "spent_usd": e.spent_usd,
+                    "attempted_cost_usd": e.attempted_cost_usd,
+                },
+            )
+        if isinstance(e, JobNotFoundError):
+            raise HTTPException(status_code=404, detail={"error": "job_not_found", "message": str(e)})
+
         REQUEST_COUNT.labels(provider=provider, status="error").inc()
         logger.error("request_failed", extra={
             "provider": provider,
@@ -323,3 +347,57 @@ def clear_all_cache():
         "redis_cleared": redis_ok,
         "milvus_cleared": milvus_ok,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Job Management Endpoints (Feature C - Budget Enforcement)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class JobCreateRequest(BaseModel):
+    tenant_id: str | None = None
+    budget_usd: float = 0.25
+
+
+class JobBudgetUpdateRequest(BaseModel):
+    budget_usd: float
+
+
+@app.post("/jobs")
+def create_job_endpoint(request: JobCreateRequest):
+    """Create a new job with an allocated spending budget."""
+    from gateway.budget import create_job
+    try:
+        return create_job(tenant_id=request.tenant_id, budget_usd=request.budget_usd)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("job_create_failed", extra={"error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+
+@app.get("/jobs/{job_id}")
+def get_job_endpoint(job_id: str):
+    """Query budget limit, cumulative spend, and status for a job."""
+    from gateway.budget import get_job, JobNotFoundError
+    try:
+        return get_job(job_id=job_id)
+    except JobNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    except Exception as e:
+        logger.error("job_get_failed", extra={"job_id": job_id, "error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+
+@app.put("/jobs/{job_id}/budget")
+def update_job_budget_endpoint(job_id: str, request: JobBudgetUpdateRequest):
+    """Adjust or top up budget for an existing job."""
+    from gateway.budget import update_budget, JobNotFoundError
+    try:
+        return update_budget(job_id=job_id, new_budget_usd=request.budget_usd)
+    except JobNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("job_budget_update_failed", extra={"job_id": job_id, "error": str(e)})
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")

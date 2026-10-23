@@ -186,16 +186,16 @@ def _estimate_quality(prompt: str, response: str, latency_ms: int) -> tuple[floa
     return score, label
 
 
-def _log_to_db(provider, model, prompt, response, latency_ms, cost, quality_score):
+def _log_to_db(provider, model, prompt, response, latency_ms, cost, quality_score, job_id: Optional[str] = None):
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         cur = conn.cursor()
 
         cur.execute("""
             INSERT INTO llm_requests
-            (provider, model, prompt, response, latency_ms, cost_usd, quality_score)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (provider, model, prompt, response, latency_ms, cost, quality_score))
+            (provider, model, prompt, response, latency_ms, cost_usd, quality_score, job_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (provider, model, prompt, response, latency_ms, cost, quality_score, job_id))
 
         conn.commit()
         cur.close()
@@ -313,6 +313,7 @@ def send_prompt(
     temperature: float = 0.7,
     max_tokens: int = 1024,
     routing_mode: Optional[str] = None,
+    job_id: Optional[str] = None,
 ) -> dict:
     overall_start_time = time.time()
     routing_mode = routing_mode or DEFAULT_ROUTING_MODE
@@ -349,6 +350,7 @@ def send_prompt(
             latency_ms=latency_ms,
             cost=0.0,
             quality_score=quality_score,
+            job_id=job_id,
         )
 
         return {
@@ -413,6 +415,7 @@ def send_prompt(
             latency_ms=latency_ms,
             cost=0.0,
             quality_score=quality_score,
+            job_id=job_id,
         )
 
         # Write-through semantic hit to Redis so future exact requests resolve faster.
@@ -505,6 +508,11 @@ def send_prompt(
     # Estimate against the first (preferred) provider before calling the API.
     estimated = estimate_cost(prompt, ordered_providers[0], model, max_tokens)
 
+    # Budget circuit breaker: if request is tagged with a job_id, verify available balance.
+    if job_id:
+        from gateway.budget import check_and_reserve
+        check_and_reserve(job_id=job_id, estimated_cost_usd=estimated["estimated_cost_usd"])
+
     call = _invoke_with_failover(
         prompt=prompt,
         ordered_providers=ordered_providers,
@@ -522,6 +530,11 @@ def send_prompt(
     actual_cost = _calculate_cost(model_name, input_tokens, output_tokens, provider)
     quality_score, quality_label = _estimate_quality(prompt, text, latency_ms)
     prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+    # Commit actual spend against job balance if applicable.
+    if job_id:
+        from gateway.budget import commit_spend
+        commit_spend(job_id=job_id, actual_cost_usd=actual_cost)
 
     # Structured log for every request
     logger.info("request_completed", extra={
@@ -548,6 +561,7 @@ def send_prompt(
         "failed_providers": call["failed_providers"],
         "routing_mode": routing_meta.get("mode"),
         "smart_routing_used": routing_meta.get("smart_used"),
+        "job_id": job_id,
     })
 
     _log_to_db(
@@ -557,7 +571,8 @@ def send_prompt(
         response=text,
         latency_ms=latency_ms,
         cost=actual_cost,
-        quality_score=quality_score
+        quality_score=quality_score,
+        job_id=job_id,
     )
 
     try:
