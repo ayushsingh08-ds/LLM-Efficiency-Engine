@@ -81,7 +81,7 @@ def _get_default_model(provider_name: str) -> str:
         return "unknown"
 
 MAX_LOG_TEXT_LENGTH = 500
-DEFAULT_CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.95"))
+DEFAULT_CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.85"))
 _cache_similarity_threshold = DEFAULT_CACHE_SIMILARITY_THRESHOLD
 
 
