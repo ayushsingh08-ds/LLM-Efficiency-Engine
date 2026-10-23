@@ -36,24 +36,24 @@ class DifficultyResult(TypedDict):
 _FRONTIER_PATTERNS = [
     # Multi-step reasoning & logic
     (r"\b(step[-\s]by[-\s]step|chain[-\s]of[-\s]thought|think[-\s]carefully|reasoning|deduce|prove|proof)\b", "step_by_step_reasoning"),
-    (r"\b(if\s+all\s+.+\s+and\s+.+\s+then|syllogism|logic\s+puzzle|paradox|counterexample)\b", "formal_logic"),
+    (r"\bif\s+all\s+[^\n]{1,80}\s+and\s+[^\n]{1,80}\s+then\b|\b(syllogism|logic\s+puzzle|paradox|counterexample)\b", "formal_logic"),
     
     # Coding, algorithms, and technical debugging
-    (r"\b(def\s+\w+|function\s+\w+|class\s+\w+|public\s+void|async\s+def|import\s+\w+|SELECT\s+.+\s+FROM)\b", "code_syntax"),
+    (r"\b(def\s+\w+|function\s+\w+|class\s+\w+|public\s+void|async\s+def|import\s+\w+|SELECT\s+[^\n]{1,100}\s+FROM)\b", "code_syntax"),
     (r"\b(debug|refactor|stack trace|segfault|nullpointer|race condition|deadlock|time complexity|big[-\s]o|algorithm|dynamic programming)\b", "code_debugging_or_algo"),
     (r"\b(architecture|microservices|distributed system|consensus|raft|paxos|event-driven|database schema|sharding)\b", "system_design"),
     
     # In-depth analysis & synthesis
     (r"\b(compare and contrast|critique|pros and cons in detail|trade-offs|root cause analysis|mathematical derivation)\b", "comparative_analysis"),
     (r"\b(differential equation|integral|eigenvalue|linear algebra|probability distribution|bayesian)\b", "advanced_math"),
-    (r"\b(write a (test suite|unit test|compiler|parser|interpreter|lexer|neural network|smart contract))\b", "complex_generation"),
+    (r"\bwrite a (test suite|unit test|compiler|parser|interpreter|lexer|neural network|smart contract)\b", "complex_generation"),
 ]
 
 # Patterns typically indicating simple, low-cost requests
 _CHEAP_PATTERNS = [
     (r"^(what|when|where|who)\s+is\s+the\s+(capital|president|currency|founder|population|birthday|definition|meaning)\s+of\b", "factual_lookup"),
     (r"^(hello|hi|hey|greetings|good\s+(morning|afternoon|evening))\b", "chit_chat"),
-    (r"^(translate|say)\s+.+\s+in\s+[a-zA-Z]+\.?$", "simple_translation"),
+    (r"^(translate|say)\s+[^\n]{1,100}\s+in\s+[a-zA-Z]+\.?$", "simple_translation"),
     (r"^(define|what is|what are)\s+[\w\s]{1,30}\??$", "short_definition"),
 ]
 

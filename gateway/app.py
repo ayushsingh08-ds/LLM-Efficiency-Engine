@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel, Field
 from gateway.llm_provider import (
     AllProvidersFailedError,
     estimate_cost,
@@ -11,9 +11,11 @@ from gateway.llm_provider import (
 from gateway.provider_registry import registry as provider_registry
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import time
+import uuid
 from cache import redis_cache, milvus_cache
 from gateway import hardware as hw_module
 from gateway.hardware import sample_hardware, sample_as_dict
+from gateway.auth import verify_client_key, verify_admin_key
 
 app = FastAPI()
 
@@ -72,7 +74,8 @@ def _refresh_hardware_gauges() -> dict:
     return result
 
 class PromptRequest(BaseModel):
-    prompt: str
+    # Bound max prompt length to 32,000 characters to prevent memory exhaustion
+    prompt: str = Field(..., min_length=1, max_length=32000)
     provider: str | None = None
     # "roundrobin" (default), "difficulty" (heuristic cheap vs frontier), or "smart" (k-NN).
     # Routing modes apply when no explicit provider is given.
@@ -81,10 +84,22 @@ class PromptRequest(BaseModel):
 
 
 class ClassifyRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(..., min_length=1, max_length=32000)
 
 
-@app.post("/difficulty/classify")
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    messages: list[ChatMessage]
+    model: str | None = None
+    routing_mode: str | None = None
+    job_id: str | None = None
+
+
+@app.post("/difficulty/classify", dependencies=[Depends(verify_client_key)])
 def classify_prompt_endpoint(request: ClassifyRequest):
     """Inspect how a prompt would be classified by the difficulty router."""
     from gateway.difficulty import classify_difficulty
@@ -140,7 +155,7 @@ def list_providers():
     return {"providers": out, "enabled": provider_registry.enabled_names}
 
 
-@app.post("/providers/reload")
+@app.post("/providers/reload", dependencies=[Depends(verify_admin_key)])
 def reload_providers():
     """Hot-reload configs/providers.yaml without restarting the gateway.
 
@@ -165,14 +180,14 @@ def hardware():
     energy_is_measured is true (real GPU power telemetry)."""
     return _refresh_hardware_gauges()
 
-@app.post("/estimate")
+@app.post("/estimate", dependencies=[Depends(verify_client_key)])
 def estimate(request: PromptRequest):
     return estimate_cost(
         prompt=request.prompt,
         provider=request.provider
     )
 
-@app.post("/generate")
+@app.post("/generate", dependencies=[Depends(verify_client_key)])
 def generate(request: PromptRequest):
     provider = request.provider or "auto"
     resolved_provider = provider
@@ -239,6 +254,68 @@ def generate(request: PromptRequest):
         CACHE_RESPONSE_LATENCY.labels(cache_status=cache_status).observe(duration)
 
 
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_client_key)])
+def chat_completions(request: ChatCompletionRequest):
+    """OpenAI SDK drop-in compatible endpoint.
+
+    Allows any client using `openai.OpenAI(base_url='http://.../v1', api_key='...')`
+    to call this gateway seamlessly.
+    """
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="messages list cannot be empty")
+
+    # Combine message history or take the last user message as prompt
+    # For efficiency and caching, we format the messages into a prompt
+    if len(request.messages) == 1:
+        prompt_text = request.messages[0].content
+    else:
+        formatted = []
+        for msg in request.messages:
+            formatted.append(f"{msg.role.capitalize()}: {msg.content}")
+        prompt_text = "\n".join(formatted)
+
+    # Route through send_prompt
+    result = send_prompt(
+        prompt=prompt_text,
+        provider=request.model,
+        routing_mode=request.routing_mode,
+        job_id=request.job_id,
+    )
+
+    response_text = result.get("response", "")
+    provider_name = result.get("provider", "gateway")
+    tokens_meta = result.get("tokens", {})
+    prompt_tokens = tokens_meta.get("input_tokens", max(1, len(prompt_text) // 4))
+    completion_tokens = tokens_meta.get("output_tokens", max(1, len(response_text) // 4))
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": provider_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response_text,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        "_gateway_metadata": {
+            "cache": result.get("cache"),
+            "difficulty": result.get("difficulty"),
+            "cost_usd": result.get("cost_usd"),
+        },
+    }
+
+
 class CacheInvalidateRequest(BaseModel):
     prompt: str | None = None
     pattern: str | None = None
@@ -252,7 +329,7 @@ class SimilarityThresholdRequest(BaseModel):
     threshold: float
 
 
-@app.post("/cache/invalidate")
+@app.post("/cache/invalidate", dependencies=[Depends(verify_admin_key)])
 def invalidate_cache(request: CacheInvalidateRequest):
     """
     Manually invalidate cache entries.
@@ -323,7 +400,7 @@ def get_cache_config():
     }
 
 
-@app.put("/cache/config/similarity-threshold")
+@app.put("/cache/config/similarity-threshold", dependencies=[Depends(verify_admin_key)])
 def update_similarity_threshold(request: SimilarityThresholdRequest):
     try:
         updated = set_cache_similarity_threshold(request.threshold)
@@ -336,7 +413,7 @@ def update_similarity_threshold(request: SimilarityThresholdRequest):
     }
 
 
-@app.delete("/cache")
+@app.delete("/cache", dependencies=[Depends(verify_admin_key)])
 def clear_all_cache():
     """Clear all cache entries from both Redis and Milvus."""
     logger.info("cache_clear_all_requested")
@@ -362,7 +439,7 @@ class JobBudgetUpdateRequest(BaseModel):
     budget_usd: float
 
 
-@app.post("/jobs")
+@app.post("/jobs", dependencies=[Depends(verify_admin_key)])
 def create_job_endpoint(request: JobCreateRequest):
     """Create a new job with an allocated spending budget."""
     from gateway.budget import create_job
@@ -375,7 +452,7 @@ def create_job_endpoint(request: JobCreateRequest):
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
 
-@app.get("/jobs/{job_id}")
+@app.get("/jobs/{job_id}", dependencies=[Depends(verify_admin_key)])
 def get_job_endpoint(job_id: str):
     """Query budget limit, cumulative spend, and status for a job."""
     from gateway.budget import get_job, JobNotFoundError
@@ -388,7 +465,7 @@ def get_job_endpoint(job_id: str):
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
 
-@app.put("/jobs/{job_id}/budget")
+@app.put("/jobs/{job_id}/budget", dependencies=[Depends(verify_admin_key)])
 def update_job_budget_endpoint(job_id: str, request: JobBudgetUpdateRequest):
     """Adjust or top up budget for an existing job."""
     from gateway.budget import update_budget, JobNotFoundError

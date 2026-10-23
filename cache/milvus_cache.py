@@ -121,10 +121,12 @@ def store_cache_entry(
 
 
 def invalidate_by_prompt(prompt: str) -> bool:
-    """Delete a specific cached entry by prompt from Milvus."""
+    """Delete a specific cached entry by prompt from Milvus safely."""
     try:
         collection = get_cache_collection()
-        collection.delete(expr=f"prompt == '{prompt.replace(chr(39), chr(92) + chr(39))}'")
+        # Escape backslashes first, then escape single quotes to prevent expr injection
+        safe_prompt = prompt.replace("\\", "\\\\").replace("'", "\\'")
+        collection.delete(expr=f"prompt == '{safe_prompt}'")
         return True
     except Exception:
         return False
