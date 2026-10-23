@@ -1,4 +1,4 @@
-# ⚡ LLM Efficiency Engine
+# LLM Efficiency Engine
 
 ### *Production-Grade Cost-Aware Gateway, Semantic Cache & Intelligent Model Router*
 
@@ -11,11 +11,11 @@
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?logo=docker)](https://www.docker.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-[Interactive API Docs (Swagger)](http://localhost:8000/docs) · [OpenAI SDK Integration](#-openai-sdk-drop-in-integration) · [System Architecture](#-system-architecture) · [Quickstart Guide](#-local-setup--execution) · [Pre-Flight Verification](#-testing--pre-flight-verification)
+[Interactive API Docs (Swagger)](http://localhost:8000/docs) · [OpenAI SDK Integration](#openai-sdk-drop-in-integration) · [System Architecture](#system-architecture) · [Quickstart Guide](#local-setup--execution) · [Pre-Flight Verification](#testing--pre-flight-verification)
 
 ---
 
-## 💡 The Elevator Pitch & Business Impact
+## The Elevator Pitch & Business Impact
 
 The **LLM Efficiency Engine** solves the runaway costs, unpredictable latencies, and vendor-lockin of modern AI applications. By orchestrating a **two-tier semantic cache**, **zero-latency difficulty-aware model routing**, **multi-provider failover chains**, and **atomic budget circuit breakers**, this gateway:
 
@@ -26,7 +26,7 @@ The **LLM Efficiency Engine** solves the runaway costs, unpredictable latencies,
 
 ---
 
-## 🏛️ System Architecture
+## System Architecture
 
 ```mermaid
 flowchart TD
@@ -94,7 +94,7 @@ flowchart TD
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 | Domain | Technologies & Libraries |
 | :--- | :--- |
@@ -106,7 +106,7 @@ flowchart TD
 
 ---
 
-## 🔬 Core Features & Engineering Decisions
+## Core Features & Engineering Decisions
 
 ### 1. Two-Tier Semantic Caching (Redis L1 + Milvus L2)
 - **Implementation**: When a prompt arrives at `/generate` or `/v1/chat/completions`, the engine first hashes the query string with SHA-256 for an $O(1)$ lookup in Redis. If missed, the prompt is embedded into a 384-dimensional vector via `all-MiniLM-L6-v2` and searched against Milvus for cosine similarity $\ge 0.95$. On a vector hit, the response is written back to Redis (write-through) so identical future prompts bypass embedding generation entirely.
@@ -129,7 +129,7 @@ flowchart TD
 
 ---
 
-## 🔌 OpenAI SDK Drop-In Integration
+## OpenAI SDK Drop-In Integration
 
 The gateway natively implements the official OpenAI Chat Completions API schema. You can integrate this gateway into existing Python, TypeScript, LangChain, or LlamaIndex codebases by changing just **two lines of code**:
 
@@ -158,7 +158,7 @@ print("Tokens used:", response.usage.total_tokens)
 
 ---
 
-## 💻 Local Setup & Execution
+## Local Setup & Execution
 
 ### Prerequisites
 - **Python 3.10+** (Python 3.12 recommended)
@@ -186,7 +186,7 @@ Copy the example configuration:
 ```bash
 cp .env.example .env
 ```
-Open `.env` and add your provider keys (e.g. `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, or `GROQ_API_KEY`). For production, also set `GATEWAY_API_KEY` and `ADMIN_API_KEY`. (In local development, auth defaults to open bypass if keys are omitted).
+Open `.env` and add your provider keys (e.g. `GEMINI_API_KEY`, `OPENROUTER_API_KEY`). For production, also set `GATEWAY_API_KEY` and `ADMIN_API_KEY`. (In local development, auth defaults to open bypass if keys are omitted).
 
 ### 3. Launch Infrastructure (Docker Compose)
 Start PostgreSQL, Redis, Milvus, MinIO, etcd, and Grafana:
@@ -211,7 +211,7 @@ The gateway is now live at:
 
 ---
 
-## 🧪 Testing & Pre-Flight Verification
+## Testing & Pre-Flight Verification
 
 The repository contains a 55-test unit suite and an end-to-end pre-flight verification harness that validates security guardrails and live endpoints.
 
@@ -233,7 +233,7 @@ pytest -v
 
 ---
 
-## 📡 API Reference Summary
+## API Reference Summary
 
 | Method | Endpoint | Access | Description |
 | :--- | :--- | :---: | :--- |
@@ -253,5 +253,5 @@ pytest -v
 
 ---
 
-## 📄 License
+## License
 Distributed under the **MIT License**. See `LICENSE` for more information.
