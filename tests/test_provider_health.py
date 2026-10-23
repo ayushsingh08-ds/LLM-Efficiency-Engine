@@ -6,8 +6,23 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from gateway import llm_provider, smart_router
+from gateway import provider_registry as pr_module
 from gateway.llm_provider import send_prompt
 from gateway.provider_health import ProviderHealthRegistry, registry as global_registry
+
+
+def _make_send(responses: dict, errors: dict | None = None):
+    """Build a side_effect for patching provider_registry.send."""
+    errors = errors or {}
+
+    def _send(provider_name, prompt, model=None, temperature=0.7, max_tokens=1024):
+        if provider_name in errors:
+            raise errors[provider_name]
+        if provider_name in responses:
+            return responses[provider_name]
+        raise KeyError(f"Unexpected provider in test: {provider_name!r}")
+
+    return _send
 
 
 class TestProviderHealthRegistry(unittest.TestCase):
@@ -77,9 +92,12 @@ class TestHealthAwareRoutingOnGateway(unittest.TestCase):
         smart_router.reset_cache()
 
     def test_failure_then_success_records_health(self) -> None:
+        send_mock = _make_send(
+            responses={"ollama": ("ok", 1, 2)},
+            errors={"groq": RuntimeError("boom")},
+        )
         with patch.object(llm_provider.router, "next_provider", return_value="groq"), \
-             patch.object(llm_provider, "_send_to_groq", side_effect=RuntimeError("boom")), \
-             patch.object(llm_provider, "_send_to_ollama", return_value=("ok", 1, 2)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             send_prompt("hi")
         snap = global_registry.snapshot()
         self.assertEqual(snap["groq"]["total_failures"], 1)
@@ -92,17 +110,14 @@ class TestHealthAwareRoutingOnGateway(unittest.TestCase):
 
         called = []
 
-        def groq_spy(*a, **k):
-            called.append("groq")
-            raise RuntimeError("groq still down")
-
-        def ollama_spy(*a, **k):
-            called.append("ollama")
+        def _send(provider_name, prompt, model=None, temperature=0.7, max_tokens=1024):
+            called.append(provider_name)
+            if provider_name == "groq":
+                raise RuntimeError("groq still down")
             return ("ok", 1, 2)
 
         with patch.object(llm_provider.router, "next_provider", return_value="groq"), \
-             patch.object(llm_provider, "_send_to_groq", side_effect=groq_spy), \
-             patch.object(llm_provider, "_send_to_ollama", side_effect=ollama_spy):
+             patch.object(pr_module.registry, "send", side_effect=_send):
             result = send_prompt("hi")
 
         # Healthy ollama tried first despite round-robin picking groq.
@@ -119,8 +134,9 @@ class TestHealthAwareRoutingOnGateway(unittest.TestCase):
             estimated_cost_usd=0.0, quality_score=7.0, reliability_metric=0.9, neighbor_count=3,
         )
         fake_knn = SimpleNamespace(route=lambda prompt, quality_threshold=6.5: fake_decision)
+        send_mock = _make_send({"ollama": ("ok", 1, 2)})
         with patch.object(smart_router, "_load_knn_router", return_value=fake_knn), \
-             patch.object(llm_provider, "_send_to_ollama", return_value=("ok", 1, 2)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             result = send_prompt("route me", routing_mode="smart")
         self.assertEqual(result["provider"], "ollama")
         self.assertTrue(result["routing"]["smart_used"])
@@ -129,13 +145,11 @@ class TestHealthAwareRoutingOnGateway(unittest.TestCase):
         # A Redis exact-match hit must short-circuit before any provider/health logic.
         with patch.object(llm_provider, "get_cached_response",
                           return_value={"response": "cached!", "model": "exact-cache"}), \
-             patch.object(llm_provider, "_send_to_groq") as groq, \
-             patch.object(llm_provider, "_send_to_ollama") as ollama:
+             patch.object(pr_module.registry, "send") as send_mock:
             result = send_prompt("hi")
         self.assertTrue(result["cache"]["hit"])
         self.assertEqual(result["provider"], "cache")
-        groq.assert_not_called()
-        ollama.assert_not_called()
+        send_mock.assert_not_called()
         # No provider calls => no health state recorded.
         self.assertEqual(global_registry.snapshot(), {})
 

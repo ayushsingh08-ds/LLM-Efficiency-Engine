@@ -9,8 +9,23 @@ from fastapi.testclient import TestClient
 
 from gateway import app as app_module
 from gateway import llm_provider, smart_router
+from gateway import provider_registry as pr_module
 from gateway.app import app
 from gateway.provider_health import registry as health_registry
+
+
+def _make_send(responses: dict, errors: dict | None = None):
+    """Build a side_effect for patching provider_registry.send."""
+    errors = errors or {}
+
+    def _send(provider_name, prompt, model=None, temperature=0.7, max_tokens=1024):
+        if provider_name in errors:
+            raise errors[provider_name]
+        if provider_name in responses:
+            return responses[provider_name]
+        raise KeyError(f"Unexpected provider in test: {provider_name!r}")
+
+    return _send
 
 
 class TestGatewayIntegration(unittest.TestCase):
@@ -42,8 +57,9 @@ class TestGatewayIntegration(unittest.TestCase):
         health_registry.reset()
 
     def test_generate_success_roundrobin(self) -> None:
+        send_mock = _make_send({"groq": ("hi there", 3, 5)})
         with patch.object(llm_provider.router, "next_provider", return_value="groq"), \
-             patch.object(llm_provider, "_send_to_groq", return_value=("hi there", 3, 5)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             resp = self.client.post("/generate", json={"prompt": "hello"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
@@ -51,9 +67,12 @@ class TestGatewayIntegration(unittest.TestCase):
         self.assertFalse(body["failover"]["used"])
 
     def test_generate_failover_over_http(self) -> None:
+        send_mock = _make_send(
+            responses={"ollama": ("fallback answer", 2, 4)},
+            errors={"groq": RuntimeError("groq down")},
+        )
         with patch.object(llm_provider.router, "next_provider", return_value="groq"), \
-             patch.object(llm_provider, "_send_to_groq", side_effect=RuntimeError("groq down")), \
-             patch.object(llm_provider, "_send_to_ollama", return_value=("fallback answer", 2, 4)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             resp = self.client.post("/generate", json={"prompt": "hello"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
@@ -62,9 +81,12 @@ class TestGatewayIntegration(unittest.TestCase):
         self.assertEqual(body["failover"]["failed_providers"], ["groq"])
 
     def test_generate_all_fail_returns_502(self) -> None:
+        send_mock = _make_send(
+            responses={},
+            errors={"groq": RuntimeError("groq down"), "ollama": RuntimeError("ollama down")},
+        )
         with patch.object(llm_provider.router, "next_provider", return_value="groq"), \
-             patch.object(llm_provider, "_send_to_groq", side_effect=RuntimeError("groq down")), \
-             patch.object(llm_provider, "_send_to_ollama", side_effect=RuntimeError("ollama down")):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             resp = self.client.post("/generate", json={"prompt": "hello"})
         self.assertEqual(resp.status_code, 502)
         detail = resp.json()["detail"]
@@ -78,8 +100,9 @@ class TestGatewayIntegration(unittest.TestCase):
             reliability_metric=0.9, neighbor_count=3,
         )
         fake_knn = SimpleNamespace(route=lambda prompt, quality_threshold=6.5: fake_decision)
+        send_mock = _make_send({"ollama": ("smart answer", 2, 4)})
         with patch.object(smart_router, "_load_knn_router", return_value=fake_knn), \
-             patch.object(llm_provider, "_send_to_ollama", return_value=("smart answer", 2, 4)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             resp = self.client.post("/generate", json={"prompt": "design a system", "routing_mode": "smart"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
@@ -88,9 +111,10 @@ class TestGatewayIntegration(unittest.TestCase):
 
     def test_generate_survives_redis_cache_unavailable(self) -> None:
         # Redis lookup raises -> gateway must bypass cache and still serve a live answer.
+        send_mock = _make_send({"groq": ("live answer", 3, 5)})
         with patch.object(llm_provider, "get_cached_response", side_effect=RuntimeError("redis down")), \
              patch.object(llm_provider.router, "next_provider", return_value="groq"), \
-             patch.object(llm_provider, "_send_to_groq", return_value=("live answer", 3, 5)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             resp = self.client.post("/generate", json={"prompt": "hello"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
@@ -99,9 +123,10 @@ class TestGatewayIntegration(unittest.TestCase):
 
     def test_generate_survives_vector_store_unavailable(self) -> None:
         # Milvus semantic search raises -> gateway must bypass cache and serve live.
+        send_mock = _make_send({"groq": ("live answer", 3, 5)})
         with patch.object(llm_provider, "search_similar_embedding", side_effect=RuntimeError("milvus down")), \
              patch.object(llm_provider.router, "next_provider", return_value="groq"), \
-             patch.object(llm_provider, "_send_to_groq", return_value=("live answer", 3, 5)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             resp = self.client.post("/generate", json={"prompt": "hello"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()

@@ -6,7 +6,22 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from gateway import llm_provider, smart_router
+from gateway import provider_registry as pr_module
 from gateway.llm_provider import send_prompt
+
+
+def _make_send(responses: dict, errors: dict | None = None):
+    """Build a side_effect for patching provider_registry.send."""
+    errors = errors or {}
+
+    def _send(provider_name, prompt, model=None, temperature=0.7, max_tokens=1024):
+        if provider_name in errors:
+            raise errors[provider_name]
+        if provider_name in responses:
+            return responses[provider_name]
+        raise KeyError(f"Unexpected provider in test: {provider_name!r}")
+
+    return _send
 
 
 class TestSmartRoutingOnGateway(unittest.TestCase):
@@ -41,24 +56,26 @@ class TestSmartRoutingOnGateway(unittest.TestCase):
             neighbor_count=3,
         )
         fake_knn = SimpleNamespace(route=lambda prompt, quality_threshold=6.5: fake_decision)
+        send_mock = _make_send({"ollama": ("ollama answer", 4, 8)})
 
         with patch.object(smart_router, "_load_knn_router", return_value=fake_knn) as loader, \
-             patch.object(llm_provider, "_send_to_ollama", return_value=("ollama answer", 4, 8)) as ollama, \
-             patch.object(llm_provider, "_send_to_groq") as groq:
+             patch.object(pr_module.registry, "send", side_effect=send_mock) as send_spy:
             result = send_prompt("Explain OAuth threat modeling", routing_mode="smart")
 
         loader.assert_called_once()  # the smart router was actually consulted
         self.assertEqual(result["provider"], "ollama")  # its choice was honoured
         self.assertTrue(result["routing"]["smart_used"])
         self.assertEqual(result["routing"]["mode"], "smart")
-        ollama.assert_called_once()
-        groq.assert_not_called()
+        # registry.send was called exactly once with "ollama", never with "groq"
+        calls = [c.args[0] for c in send_spy.call_args_list]
+        self.assertEqual(calls, ["ollama"])
 
     def test_smart_mode_falls_back_to_roundrobin_when_unavailable(self) -> None:
         # Artifacts missing -> loader returns None -> gateway must still work.
+        send_mock = _make_send({"groq": ("groq answer", 10, 20)})
         with patch.object(smart_router, "_load_knn_router", return_value=None), \
              patch.object(llm_provider.router, "next_provider", return_value="groq"), \
-             patch.object(llm_provider, "_send_to_groq", return_value=("groq answer", 10, 20)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             result = send_prompt("hello", routing_mode="smart")
 
         self.assertEqual(result["provider"], "groq")
@@ -76,20 +93,22 @@ class TestSmartRoutingOnGateway(unittest.TestCase):
             neighbor_count=3,
         )
         fake_knn = SimpleNamespace(route=lambda prompt, quality_threshold=6.5: fake_decision)
+        send_mock = _make_send({"groq": ("groq answer", 10, 20)})
 
         with patch.object(smart_router, "_load_knn_router", return_value=fake_knn), \
-             patch.object(llm_provider, "_send_to_groq", return_value=("groq answer", 10, 20)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             result = send_prompt("Design a system", routing_mode="smart")
 
-        # Mapped to a supported provider (groq is first in SUPPORTED_PROVIDERS).
+        # Mapped to a supported provider (groq is first in SUPPORTED_PROVIDERS)
         self.assertIn(result["provider"], llm_provider.SUPPORTED_PROVIDERS)
         self.assertTrue(result["routing"]["smart_used"])
         self.assertEqual(result["routing"]["reason"], "unsupported_choice:openai")
 
     def test_roundrobin_mode_does_not_call_smart_router(self) -> None:
+        send_mock = _make_send({"groq": ("groq answer", 10, 20)})
         with patch.object(smart_router, "_load_knn_router") as loader, \
              patch.object(llm_provider.router, "next_provider", return_value="groq"), \
-             patch.object(llm_provider, "_send_to_groq", return_value=("groq answer", 10, 20)):
+             patch.object(pr_module.registry, "send", side_effect=send_mock):
             result = send_prompt("hello", routing_mode="roundrobin")
 
         loader.assert_not_called()

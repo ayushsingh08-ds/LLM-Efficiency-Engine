@@ -1,0 +1,30 @@
+# Test provider configuration used by test suites so unit/integration tests
+# test failover, health, and routing deterministically across simulated providers.
+
+providers:
+
+  - name: groq
+    enabled: true
+    api_style: openai
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    default_model: llama-3.1-8b-instant
+    timeout_seconds: 60
+    models:
+      - id: llama-3.1-8b-instant
+        tier: cheap
+        input_cost_per_1m:  0.05
+        output_cost_per_1m: 0.08
+
+  - name: ollama
+    enabled: true
+    api_style: ollama
+    base_url: http://localhost:11434
+    api_key_env: OLLAMA_API_KEY
+    default_model: gemma3:4b
+    timeout_seconds: 120
+    models:
+      - id: gemma3:4b
+        tier: cheap
+        input_cost_per_1m:  0.0
+        output_cost_per_1m: 0.0
