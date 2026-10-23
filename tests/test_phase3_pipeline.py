@@ -34,7 +34,7 @@ class TestPhase3Pipeline(unittest.TestCase):
             result = score_quality_file(
                 input_csv=str(input_csv),
                 output_csv=str(out_csv),
-                model_config="configs/models.yaml",
+                model_config=None,
                 judge_provider=None,
             )
 

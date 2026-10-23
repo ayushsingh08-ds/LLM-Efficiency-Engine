@@ -51,7 +51,7 @@ class QualityScoreResult:
 def score_quality_file(
     input_csv: str,
     output_csv: str,
-    model_config: str,
+    model_config: str | None = None,
     judge_provider: str | None = None,
 ) -> pd.DataFrame:
     df = pd.read_csv(input_csv)
@@ -61,7 +61,7 @@ def score_quality_file(
         raise ValueError(f"Missing columns in quality input: {missing}")
 
     judge_client = None
-    if judge_provider:
+    if judge_provider and model_config:
         for client in ClientFactory.load_from_config(model_config):
             if client.provider_name == judge_provider.lower():
                 judge_client = client
