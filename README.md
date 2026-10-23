@@ -49,14 +49,11 @@ flowchart TD
     subgraph RoutingTier ["Intelligent Routing & Circuit Breaker"]
         BudgetBreaker{"Postgres Budget Breaker\n(SELECT ... FOR UPDATE)"}
         DiffRouter{"Difficulty Classifier\n(RouteLLM / FrugalGPT Heuristics)"}
-        KNNRouter{"Smart k-NN Router\n(Offline Contrastive Embeddings)"}
     end
 
     subgraph ProviderLayer ["Multi-Provider Failover Mesh"]
         GoogleGemini["Google Gemini 2.5 Flash Lite\n(Cheap Tier)"]
         OpenRouter["OpenRouter / Flint / DeepSeek\n(Frontier Tier)"]
-        GroqCloud["Groq Llama 3 8B\n(Cheap Tier)"]
-        OllamaLocal["Local / Self-Hosted Ollama\n(Private Tier)"]
     end
 
     subgraph Observability ["Telemetry & Persistence"]
@@ -82,13 +79,12 @@ flowchart TD
 
     DiffRouter -- "Simple (Short / Factual)" --> GoogleGemini
     DiffRouter -- "Complex (Logic / Code / System)" --> OpenRouter
-    DiffRouter -.-> KNNRouter
 
-    GoogleGemini -- "Failover on 5xx / Timeout" --> GroqCloud
-    OpenRouter -- "Failover on 5xx / Timeout" --> OllamaLocal
+    GoogleGemini -- "Failover on 5xx / Timeout" --> OpenRouter
+    OpenRouter -- "Failover on 5xx / Timeout" --> GoogleGemini
 
-    GoogleGemini & OpenRouter & GroqCloud & OllamaLocal --> MilvusCache
-    GoogleGemini & OpenRouter & GroqCloud & OllamaLocal --> PGLogs
+    GoogleGemini & OpenRouter --> MilvusCache
+    GoogleGemini & OpenRouter --> PGLogs
     Hardware --> Prometheus --> Grafana
 ```
 
@@ -100,7 +96,7 @@ flowchart TD
 | :--- | :--- |
 | **Backend & Gateway** | **Python 3.12**, **FastAPI**, **Uvicorn**, **Pydantic v2** (strict payload validation & bounding) |
 | **Databases & Vector Stores** | **PostgreSQL 15** (ACID transactional audit & budgets), **Redis 7** (Alpine in-memory cache), **Milvus v2.4.4** (distributed vector database), **MinIO**, **etcd** |
-| **AI / Machine Learning** | **Sentence-Transformers** (`all-MiniLM-L6-v2`, 384-dim dense embeddings), **PyTorch**, **scikit-learn** (contrastive prompt encoder, k-NN router), **RouteLLM / FrugalGPT Heuristic Engine** |
+| **AI / Machine Learning** | **Sentence-Transformers** (`all-MiniLM-L6-v2`, 384-dim dense embeddings), **PyTorch**, **RouteLLM / FrugalGPT Heuristic Engine** |
 | **Security & Reliability** | **Constant-Time Auth** (`secrets.compare_digest`), **RBAC Key Hierarchy** (`GATEWAY_API_KEY` vs `ADMIN_API_KEY`), **ReDoS Backtracking Guard**, **Vector Injection Sanitizer**, **Docker Localhost Isolation** |
 | **Observability & Infra** | **Docker & Docker Compose**, **Prometheus Metrics Exporter** (`/metrics`), **Grafana 11**, **NVIDIA NVML** (`pynvml` real GPU wattage telemetry), **psutil** |
 
