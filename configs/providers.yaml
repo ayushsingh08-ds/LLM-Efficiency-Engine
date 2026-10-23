@@ -1,0 +1,41 @@
+# Live gateway provider configuration.
+#
+# To add a new provider:
+#   1. Add a new entry under `providers` with all required fields.
+#   2. Set the API key env-var in your .env file.
+#   3. That's it — no Python changes needed.
+#
+# To disable a provider without deleting it, set `enabled: false`.
+#
+# api_style options:
+#   openai    — standard OpenAI chat-completions format (OpenRouter, Google AI Studio via OpenAI compatibility endpoint, Groq, Mistral, etc.)
+#   ollama    — Ollama's native /api/chat streaming format
+
+providers:
+
+  - name: openrouter
+    enabled: true
+    api_style: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    default_model: recursive/flint-v1.0:free
+    timeout_seconds: 60
+    models:
+      - id: recursive/flint-v1.0:free
+        tier: frontier
+        input_cost_per_1m:  0.0
+        output_cost_per_1m: 0.0
+
+  - name: google
+    enabled: true
+    api_style: openai
+    # Google AI Studio OpenAI-compatible endpoint
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY
+    default_model: Gemini 2.5 Flash Lite
+    timeout_seconds: 60
+    models:
+      - id: Gemini 2.5 Flash Lite
+        tier: cheap
+        input_cost_per_1m:  0.10
+        output_cost_per_1m: 0.40

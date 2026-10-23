@@ -4,8 +4,6 @@ try:
     import torch.nn as nn
 except ImportError:
     pass
-import requests
-import json
 import time
 import logging
 import psycopg2
@@ -15,6 +13,7 @@ from prometheus_client import Counter
 from pythonjsonlogger import jsonlogger
 from gateway.router import RoundRobinRouter
 from gateway.provider_health import registry as health_registry
+from gateway.provider_registry import registry as provider_registry
 from cache.embeddings import prompt_to_vector
 from cache.milvus_cache import search_similar_embedding, store_cache_entry
 from cache.redis_cache import get_cached_response, store_cached_response
@@ -32,15 +31,6 @@ if not logger.handlers:
     ))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
-# API configuration (all secrets sourced from environment / .env)
-OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "https://ollama.com/api")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
-
-# Per-provider HTTP timeout (seconds). Applied to every live provider call so a
-# hung provider triggers failover instead of blocking the request forever.
-PROVIDER_TIMEOUT_SECONDS = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60"))
-
 DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
     "database": os.getenv("DB_NAME"),
@@ -48,10 +38,9 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD")
 }
 
-# Providers the live gateway can actually dispatch to (a live client exists below).
-# NOTE: openai is defined in configs/models.yaml and src/clients for the offline
-# pipeline, but is intentionally not wired into the live gateway dispatch table.
-SUPPORTED_PROVIDERS = ["groq", "ollama"]
+# SUPPORTED_PROVIDERS is now driven by configs/providers.yaml (enabled entries).
+# Add or remove a provider there — no code changes needed here.
+SUPPORTED_PROVIDERS: list[str] = provider_registry.enabled_names
 router = RoundRobinRouter(SUPPORTED_PROVIDERS)
 
 # Prometheus metrics for failover observability. Defined on the default registry
@@ -76,16 +65,20 @@ class AllProvidersFailedError(RuntimeError):
         providers = ", ".join(a["provider"] for a in attempts) or "none"
         super().__init__(f"All providers failed ({providers})")
 
-# Pricing per token (USD) — source: console.groq.com/docs/pricing
-MODEL_PRICING = {
-    "llama-3.1-8b-instant": {"input": 0.05 / 1_000_000, "output": 0.08 / 1_000_000},
-    "gemma3:4b":            {"input": 0.0,               "output": 0.0},
-}
+# Pricing and default models are loaded from configs/providers.yaml via
+# provider_registry.  The helpers below delegate to it so the rest of this
+# file doesn't need to change.
+def _get_pricing(model_id: str, provider_name: str) -> dict:
+    """Return {input, output} cost per token in USD from the registry."""
+    return provider_registry.cost_per_token(provider_name, model_id)
 
-DEFAULT_MODELS = {
-    "groq": "llama-3.1-8b-instant",
-    "ollama": "gemma3:4b",
-}
+
+def _get_default_model(provider_name: str) -> str:
+    """Return the configured default model for a provider."""
+    try:
+        return provider_registry.default_model(provider_name)
+    except KeyError:
+        return "unknown"
 
 MAX_LOG_TEXT_LENGTH = 500
 DEFAULT_CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.95"))
@@ -127,8 +120,8 @@ def estimate_cost(
     if provider is None:
         provider = router.providers[router.index]  # peek without advancing
 
-    model_name = model or DEFAULT_MODELS.get(provider, "unknown")
-    pricing = MODEL_PRICING.get(model_name, {"input": 0.0, "output": 0.0})
+    model_name = model or _get_default_model(provider)
+    pricing = _get_pricing(model_name, provider)
 
     input_tokens = _estimate_tokens(prompt)
     # Estimate output as half of max_tokens (typical usage)
@@ -147,8 +140,8 @@ def estimate_cost(
     }
 
 
-def _calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    pricing = MODEL_PRICING.get(model, {"input": 0.0, "output": 0.0})
+def _calculate_cost(model: str, input_tokens: int, output_tokens: int, provider: str = "") -> float:
+    pricing = _get_pricing(model, provider)
     return round(input_tokens * pricing["input"] + output_tokens * pricing["output"], 8)
 
 
@@ -212,15 +205,18 @@ def _log_to_db(provider, model, prompt, response, latency_ms, cost, quality_scor
         logger.error("db_logging_failed", extra={"error": str(e)})
         
 def _get_dispatch(provider: str) -> Optional[Callable[..., tuple[str, int, int]]]:
-    """Return the live sender for a provider, or None if unsupported.
+    """Return a sender callable for a provider by delegating to the registry.
 
-    Resolved at call time so it always reflects the module-level senders,
-    and so tests can monkeypatch _send_to_groq / _send_to_ollama.
+    Returns None if the provider is unknown or disabled, so the failover
+    loop can skip it gracefully. Tests can monkeypatch provider_registry.send.
     """
-    return {
-        "groq": _send_to_groq,
-        "ollama": _send_to_ollama,
-    }.get(provider)
+    cfg = provider_registry.get(provider)
+    if cfg is None or not cfg.enabled:
+        return None
+    # Bind the provider name into the registry's generic send method.
+    def _dispatch(prompt: str, model: str, temperature: float, max_tokens: int):
+        return provider_registry.send(provider, prompt, model, temperature, max_tokens)
+    return _dispatch
 
 
 def _ordered_providers(preferred: Optional[str]) -> list[str]:
@@ -267,7 +263,7 @@ def _invoke_with_failover(
             attempts.append({"provider": provider, "error": "unsupported"})
             continue
 
-        model_name = model or DEFAULT_MODELS.get(provider, "unknown")
+        model_name = model or _get_default_model(provider)
         if previous_provider is not None:
             FAILOVER_COUNT.labels(from_provider=previous_provider, to_provider=provider).inc()
             logger.warning("provider_failover", extra={
@@ -487,7 +483,7 @@ def send_prompt(
     output_tokens = call["output_tokens"]
     latency_ms = call["latency_ms"]
 
-    actual_cost = _calculate_cost(model_name, input_tokens, output_tokens)
+    actual_cost = _calculate_cost(model_name, input_tokens, output_tokens, provider)
     quality_score, quality_label = _estimate_quality(prompt, text, latency_ms)
     prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
@@ -586,76 +582,9 @@ def send_prompt(
         },
     }
 
-def _send_to_groq(prompt: str, model: str, temperature: float, max_tokens: int) -> tuple[str, int, int]:
-    """Send prompt to Groq API. Returns (text, input_tokens, output_tokens)."""
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens
-    }
-
-    response = requests.post(url, json=payload, headers=headers, timeout=PROVIDER_TIMEOUT_SECONDS)
-    response.raise_for_status()
-
-    data = response.json()
-    text = data["choices"][0]["message"]["content"]
-    usage = data.get("usage", {})
-    input_tokens = usage.get("prompt_tokens", 0)
-    output_tokens = usage.get("completion_tokens", 0)
-
-    return text, input_tokens, output_tokens
-
-
-def _send_to_ollama(prompt: str, model: str, temperature: float, max_tokens: int) -> tuple[str, int, int]:
-    """Send prompt to Ollama Cloud API. Returns (text, input_tokens, output_tokens)."""
-
-    url = f"{OLLAMA_API_URL}/chat"
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OLLAMA_API_KEY}"
-    }
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_tokens,
-        }
-    }
-
-    response = requests.post(url, json=payload, headers=headers, timeout=PROVIDER_TIMEOUT_SECONDS)
-    response.raise_for_status()
-
-    # Ollama Cloud returns newline-delimited JSON chunks
-    full_text = ""
-    input_tokens = 0
-    output_tokens = 0
-    for line in response.text.strip().split("\n"):
-        chunk = json.loads(line)
-        if "message" in chunk and "content" in chunk["message"]:
-            full_text += chunk["message"]["content"]
-        if "prompt_eval_count" in chunk:
-            input_tokens = chunk["prompt_eval_count"]
-        if "eval_count" in chunk:
-            output_tokens = chunk["eval_count"]
-
-    return full_text.strip(), input_tokens, output_tokens
+# _send_to_groq and _send_to_ollama have been removed.
+# All provider HTTP calls are now handled by gateway.provider_registry.
+# To add a new provider: edit configs/providers.yaml — no Python changes needed.
 
 
 # Example usage

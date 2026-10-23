@@ -8,6 +8,7 @@ from gateway.llm_provider import (
     send_prompt,
     set_cache_similarity_threshold,
 )
+from gateway.provider_registry import registry as provider_registry
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import time
 from cache import redis_cache, milvus_cache
@@ -97,6 +98,52 @@ def provider_health():
     from gateway.provider_health import registry as health_registry
 
     return {"providers": health_registry.snapshot()}
+
+
+@app.get("/providers")
+def list_providers():
+    """List all providers from configs/providers.yaml and their current status."""
+    out = []
+    from gateway.provider_registry import _CONFIG_PATH
+    raw_cfgs = provider_registry._providers
+    for name, cfg in raw_cfgs.items():
+        out.append({
+            "name": name,
+            "enabled": cfg.enabled,
+            "api_style": cfg.api_style,
+            "base_url": cfg.base_url,
+            "default_model": cfg.default_model_id,
+            "timeout_seconds": cfg.timeout,
+            "models": [
+                {
+                    "id": m.id,
+                    "tier": m.tier,
+                    "input_cost_per_1m_usd": round(m.input_cost_per_token * 1_000_000, 6),
+                    "output_cost_per_1m_usd": round(m.output_cost_per_token * 1_000_000, 6),
+                }
+                for m in cfg.models.values()
+            ],
+        })
+    return {"providers": out, "enabled": provider_registry.enabled_names}
+
+
+@app.post("/providers/reload")
+def reload_providers():
+    """Hot-reload configs/providers.yaml without restarting the gateway.
+
+    After editing the YAML (adding/removing a provider, changing a model),
+    POST to this endpoint and changes take effect immediately.
+    Note: the round-robin router is NOT rebuilt automatically — restart
+    the process if you need to change the provider rotation order.
+    """
+    try:
+        provider_registry.reload()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reload failed: {e}")
+    return {
+        "status": "reloaded",
+        "enabled_providers": provider_registry.enabled_names,
+    }
 
 
 @app.get("/hardware")
