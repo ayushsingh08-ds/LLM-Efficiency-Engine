@@ -104,7 +104,11 @@ def _send_openai_style(
     resp = requests.post(url, json=payload, headers=headers, timeout=cfg.timeout)
     resp.raise_for_status()
     data = resp.json()
-    text = data["choices"][0]["message"]["content"]
+    choices = data.get("choices", [])
+    if not choices:
+        return "", 0, 0
+    message = choices[0].get("message", {})
+    text = message.get("content") or ""
     usage = data.get("usage", {})
     return text, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
 
@@ -215,6 +219,19 @@ class ProviderRegistry:
             for name, cfg in self._providers.items()
             if cfg.enabled
         }
+
+    def providers_by_tier(self, tier: str) -> list[str]:
+        """Returns enabled provider names that offer a model with the given tier ('cheap' | 'frontier')."""
+        matches = []
+        for name, cfg in self._providers.items():
+            if not cfg.enabled:
+                continue
+            # Check if default model or any configured model matches tier
+            for m in cfg.models.values():
+                if m.tier.lower() == tier.lower():
+                    matches.append(name)
+                    break
+        return matches
 
     # ── Sending ───────────────────────────────────────────────────────────────
 

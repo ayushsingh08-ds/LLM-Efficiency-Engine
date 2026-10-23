@@ -157,7 +157,7 @@ def _tokenize_for_overlap(text: str) -> set[str]:
 
 def _estimate_quality(prompt: str, response: str, latency_ms: int) -> tuple[float, str]:
     # Heuristic quality score (0-1): checks useful length, prompt-response overlap, and latency.
-    if not response.strip():
+    if not response or not str(response).strip():
         return 0.0, "poor"
 
     response_len = len(response)
@@ -452,17 +452,53 @@ def send_prompt(
         }
 
     # Cache miss on both tiers: choose the provider order, then call live providers.
-    # Smart routing (if enabled and available) proposes a supported-provider order;
-    # otherwise we fall back to round-robin. Import is lazy to avoid a circular
-    # import (smart_router imports names from this module).
-    routing_meta = {"mode": routing_mode, "smart_used": False, "reason": None}
-    smart_order: list[str] = []
-    if routing_mode == "smart" and provider is None:
-        from gateway.smart_router import choose_provider_order
-        smart_order, routing_meta = choose_provider_order(prompt, mode="smart")
+    # Supported routing modes:
+    #   - "roundrobin": cycle through enabled providers
+    #   - "smart": k-NN quality/cost contrastive router
+    #   - "difficulty": heuristic prompt difficulty classifier (cheap vs frontier models)
+    routing_meta = {"mode": routing_mode, "smart_used": False, "reason": None, "difficulty": None}
+    custom_order: list[str] = []
 
-    if smart_order:
-        ordered_providers = smart_order
+    if routing_mode == "difficulty" and provider is None:
+        from gateway.difficulty import classify_difficulty
+        diff_res = classify_difficulty(prompt)
+        target_tier = diff_res["tier"]
+        matched_providers = provider_registry.providers_by_tier(target_tier)
+        
+        # Build failover chain: matched tier providers first, then others
+        ordered = []
+        for p in matched_providers:
+            if p in SUPPORTED_PROVIDERS and p not in ordered:
+                ordered.append(p)
+        for p in SUPPORTED_PROVIDERS:
+            if p not in ordered:
+                ordered.append(p)
+
+        from gateway.provider_health import registry as health_reg
+        custom_order = health_reg.prioritize(ordered)
+        routing_meta = {
+            "mode": "difficulty",
+            "smart_used": False,
+            "target_tier": target_tier,
+            "confidence": diff_res["confidence"],
+            "signals": diff_res["signals"],
+            "reason": diff_res["reason"],
+            "primary_provider": custom_order[0] if custom_order else None,
+        }
+        logger.info("difficulty_routing_decision", extra={
+            "prompt_length": len(prompt),
+            "tier": target_tier,
+            "confidence": diff_res["confidence"],
+            "primary_provider": custom_order[0] if custom_order else None,
+            "signals": diff_res["signals"],
+        })
+
+    elif routing_mode == "smart" and provider is None:
+        from gateway.smart_router import choose_provider_order
+        custom_order, routing_meta = choose_provider_order(prompt, mode="smart")
+
+    if custom_order:
+        ordered_providers = custom_order
     else:
         ordered_providers = _ordered_providers(provider)
 
@@ -578,6 +614,9 @@ def send_prompt(
         "routing": {
             "mode": routing_meta.get("mode"),
             "smart_used": routing_meta.get("smart_used"),
+            "target_tier": routing_meta.get("target_tier"),
+            "confidence": routing_meta.get("confidence"),
+            "signals": routing_meta.get("signals"),
             "reason": routing_meta.get("reason"),
         },
     }

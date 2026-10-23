@@ -74,9 +74,21 @@ def _refresh_hardware_gauges() -> dict:
 class PromptRequest(BaseModel):
     prompt: str
     provider: str | None = None
-    # "roundrobin" (default) or "smart". Smart routing only applies when no
-    # explicit provider is given; it falls back to round-robin if unavailable.
+    # "roundrobin" (default), "difficulty" (heuristic cheap vs frontier), or "smart" (k-NN).
+    # Routing modes apply when no explicit provider is given.
     routing_mode: str | None = None
+
+
+class ClassifyRequest(BaseModel):
+    prompt: str
+
+
+@app.post("/difficulty/classify")
+def classify_prompt_endpoint(request: ClassifyRequest):
+    """Inspect how a prompt would be classified by the difficulty router."""
+    from gateway.difficulty import classify_difficulty
+    return classify_difficulty(request.prompt)
+
 
 @app.get("/metrics")
 def metrics():

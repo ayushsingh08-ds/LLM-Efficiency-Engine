@@ -25,6 +25,19 @@ providers:
     timeout_seconds: 120
     models:
       - id: gemma3:4b
-        tier: cheap
+        tier: frontier
+        input_cost_per_1m:  0.0
+        output_cost_per_1m: 0.0
+
+  - name: openrouter
+    enabled: false
+    api_style: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    default_model: recursive/flint-v1.0:free
+    timeout_seconds: 60
+    models:
+      - id: recursive/flint-v1.0:free
+        tier: frontier
         input_cost_per_1m:  0.0
         output_cost_per_1m: 0.0
